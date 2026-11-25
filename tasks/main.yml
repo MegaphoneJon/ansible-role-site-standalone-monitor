@@ -1,0 +1,74 @@
+---
+- block:
+  - name: Enable Megaphone monitoring
+    shell: "PATH=$HOME/bin:$PATH;cv en com.megaphonetech.monitoring"
+    args:
+      chdir: "{{ webroot }}"
+    become_user: "{{ run_as_user }}"
+
+  - name: Get the existing monitoring role ID
+    shell: "cv --cwd={{ gitroot }} api4 Role.get +s id +w 'name=monitor' | jq '.[].id'"
+    register: existing_role_id
+    become_user: "{{ run_as_user }}"
+    changed_when: false
+
+  - name: Create a role for monitoring
+    shell: "cv --cwd={{ gitroot }} api4 Role.create +v 'name=monitor' +v 'label=Monitor' +v 'permissions=remote monitoring' | jq '.[].id'"
+    register: create_role_id
+    become_user: "{{ run_as_user }}"
+    changed_when: create_role_id.rc == 0
+    when: existing_role_id.stdout == ''
+
+  - name: Get the existing monitor user
+    shell: "cv --cwd={{ gitroot }} api4 User.get +s id +w 'username=Monitor' | jq '.[].id'"
+    register: existing_user_id
+    become_user: "{{ run_as_user }}"
+    changed_when: false
+
+    # We don't actually record the password because we don't care what it is.
+  - name: Create a user for monitoring
+    command: "cv --cwd={{ gitroot }} api4 User.create +v 'username={{ monitoring_user }}' +v 'uf_name={{ monitoring_email }}' +v password={{ lookup('password', '/dev/null length=32') }}"
+    register: create_user_id
+    become_user: "{{ run_as_user }}"
+    changed_when: create_user_id.rc == 0
+    failed_when: not(create_user_id.rc == 0 or create_user_id.stderr is search("There is already a user account with the"))
+    when: existing_user_id.stdout == ''
+
+  - name: Set the final ids
+    set_fact:
+      role_id: "{{ existing_role_id.stdout | default(create_role_id.stdout) }}"
+      user_id: "{{ existing_user_id.stdout | default(create_user_id.stdout) }}"
+
+  - name: Get the existing UserRole
+    shell: "cv --cwd={{ gitroot }} api4 UserRole.get +s id +w 'user_id={{ user_id }}' +w 'role_id={{ role_id }}' | jq '.[].id'"
+    register: existing_userrole_id
+    become_user: "{{ run_as_user }}"
+    changed_when: false
+
+  - name: Add the monitoring role to the monitoring user
+    shell: "cv --cwd={{ gitroot }} api4 UserRole.create +v 'user_id={{ user_id }}' +v 'role_id={{ role_id }}'"
+    become_user: "{{ run_as_user }}"
+    when: existing_userrole_id.stdout == ''
+
+  - name: Create a CiviCRM contact for the monitoring user
+    shell: PATH=$HOME/bin:$PATH;echo '{"contact_type":"Individual", "display_name":"{{ monitoring_email }}","api_key":"'{{ lookup('community.general.passwordstore', client + '/' + hostname + '/' + bare_url + '/civicrm_api_key create=true length=32 create=true length=32') }}'","email":"{{ monitoring_email }}","options":{"match":"email"}}' | cv api contact.create --in=json
+    args:
+      chdir: "{{ webroot }}"
+    become_user: "{{ run_as_user }}"
+
+  #FIXME: Still need to make civicrm_uf_match have the contact ID.
+
+  - name: Disable checks that we only want to see in the 'CiviCRM infrequent' checks
+    shell: PATH=$HOME/bin:$PATH;echo '{"values":{"domain_id":"current_domain","name":"{{ item }}","is_active":false}}' | cv api4 StatusPreference.create --in=json
+    args:
+      chdir: "{{ webroot }}"
+    become_user: "{{ run_as_user }}"
+    with_items:
+      - checkDirsWritable
+      - checkUploadsAreNotAccessible
+      - checkDirectoriesAreNotBrowseable
+      - checkLogFileIsNotAccessible
+      - checkCleanurls
+    tags: be-quiet-civicrm
+
+  when: cms == 'Standalone' and contract_type is search("Civi Maintenance")
